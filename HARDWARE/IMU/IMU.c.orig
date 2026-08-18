@@ -1,0 +1,465 @@
+/* Includes ------------------------------------------------------------------*/
+#include "usart.h"
+#include "IMU.h"
+#include "myiic.h"
+
+float exInt1, eyInt1, ezInt1;  // 误差积分
+float q0, q1, q2, q3; // 全局四元数
+float integralFBhand,handdiff;
+uint32_t lastUpdate, now; // 采样周期计数 单位 us
+int16_t accgyroval[6];
+uint8_t buffer[14];
+float HMC5883_lastx,HMC5883_lasty,HMC5883_lastz;
+int16_t  MPU6050_FIFO[6][11];
+int16_t Gx_offset=0,Gy_offset=0,Gz_offset=0;
+int16_t  HMC5883_FIFO[3][11]; //磁力计滤波
+void HMC58X3_getRaw(int16_t *x,int16_t *y,int16_t *z);
+u8  BMX055_ABUF1[6];//缓存
+u8	BMX055_GBUF1[6];
+u8	BMX055_MBUF1[6];
+void get_dat(void)
+{
+
+
+}
+/**************************实现函数********************************************
+*函数原型:	   void  HMC58X3_newValues(int16_t x,int16_t y,int16_t z)
+*功　　能:	   更新一组数据到FIFO数组
+输入参数：  磁力计三个轴对应的ADC值
+输出参数：  无
+*******************************************************************************/
+void  HMC58X3_newValues(int16_t x,int16_t y,int16_t z)
+{
+	unsigned char i ;
+	int32_t sum=0;
+
+	for(i=1;i<10;i++){
+		HMC5883_FIFO[0][i-1]=HMC5883_FIFO[0][i];
+		HMC5883_FIFO[1][i-1]=HMC5883_FIFO[1][i];
+		HMC5883_FIFO[2][i-1]=HMC5883_FIFO[2][i];
+	}
+
+	HMC5883_FIFO[0][9]=x;
+	HMC5883_FIFO[1][9]=y;
+	HMC5883_FIFO[2][9]=z;
+
+	sum=0;
+	for(i=0;i<10;i++){	//取数组内的值进行求和再取平均
+   		sum+=HMC5883_FIFO[0][i];
+	}
+	HMC5883_FIFO[0][10]=sum/10;	//将平均值更新
+
+	sum=0;
+	for(i=0;i<10;i++){
+   		sum+=HMC5883_FIFO[1][i];
+	}
+	HMC5883_FIFO[1][10]=sum/10;
+
+	sum=0;
+	for(i=0;i<10;i++){
+   		sum+=HMC5883_FIFO[2][i];
+	}
+	HMC5883_FIFO[2][10]=sum/10;
+} 
+/**************************实现函数********************************************
+*函数原型:	  void HMC58X3_getRaw(int16_t *x,int16_t *y,int16_t *z)
+*功　　能:	   写HMC5883L的寄存器
+输入参数：    reg  寄存器地址
+			  val   要写入的值	
+输出参数：  无
+*******************************************************************************/
+void HMC58X3_getRaw(int16_t *x,int16_t *y,int16_t *z) {
+   BMX055_MBUF1[0]=BMX055_MBUF1[1]=BMX055_MBUF1[2]=BMX055_MBUF1[3]=BMX055_MBUF1[4]=BMX055_MBUF1[5]=0;
+   ReadData(Mag_addr,MAG_XL,BMX055_MBUF1,6);
+   HMC58X3_newValues(((BMX055_MBUF1[1]<<5) |(BMX055_MBUF1[0] >>3)),((BMX055_MBUF1[3]<<5) |(BMX055_MBUF1[2] >>3)),((BMX055_MBUF1[5]<<7) |(BMX055_MBUF1[4]>>1)));
+   *x = HMC5883_FIFO[0][10];
+   *y = HMC5883_FIFO[1][10];
+   *z = HMC5883_FIFO[2][10];
+}
+/**************************实现函数********************************************
+*函数原型:		void  MPU6050_newValues(int16_t ax,int16_t ay,int16_t az,int16_t gx,int16_t gy,int16_t gz)
+*功　　能:	    将新的ADC数据更新到 FIFO数组，进行滤波处理
+*******************************************************************************/
+void  MPU6050_newValues(int16_t ax,int16_t ay,int16_t az,int16_t gx,int16_t gy,int16_t gz)
+{
+unsigned char i ;
+int32_t sum=0;
+for(i=1;i<10;i++){	//FIFO 操作
+MPU6050_FIFO[0][i-1]=MPU6050_FIFO[0][i];
+MPU6050_FIFO[1][i-1]=MPU6050_FIFO[1][i];
+MPU6050_FIFO[2][i-1]=MPU6050_FIFO[2][i];
+MPU6050_FIFO[3][i-1]=MPU6050_FIFO[3][i];
+MPU6050_FIFO[4][i-1]=MPU6050_FIFO[4][i];
+MPU6050_FIFO[5][i-1]=MPU6050_FIFO[5][i];
+}
+MPU6050_FIFO[0][9]=ax;//将新的数据放置到 数据的最后面
+MPU6050_FIFO[1][9]=ay;
+MPU6050_FIFO[2][9]=az;
+MPU6050_FIFO[3][9]=gx;
+MPU6050_FIFO[4][9]=gy;
+MPU6050_FIFO[5][9]=gz;
+
+sum=0;
+for(i=0;i<10;i++){	//求当前数组的合，再取平均值
+   sum+=MPU6050_FIFO[0][i];
+}
+MPU6050_FIFO[0][10]=sum/10;
+
+sum=0;
+for(i=0;i<10;i++){
+   sum+=MPU6050_FIFO[1][i];
+}
+MPU6050_FIFO[1][10]=sum/10;
+
+sum=0;
+for(i=0;i<10;i++){
+   sum+=MPU6050_FIFO[2][i];
+}
+MPU6050_FIFO[2][10]=sum/10;
+
+sum=0;
+for(i=0;i<10;i++){
+   sum+=MPU6050_FIFO[3][i];
+}
+MPU6050_FIFO[3][10]=sum/10;
+
+sum=0;
+for(i=0;i<10;i++){
+   sum+=MPU6050_FIFO[4][i];
+}
+MPU6050_FIFO[4][10]=sum/10;
+
+sum=0;
+for(i=0;i<10;i++){
+   sum+=MPU6050_FIFO[5][i];
+}
+MPU6050_FIFO[5][10]=sum/10;
+}
+void IMU_Init(void)
+{
+    WriteData(Acc_addr,ACC_ret,0xb6);//reset
+    WriteData(Acc_addr,ACC_range,0x03);//+/- 2g
+    WriteData(Acc_addr,0x10,0x08);//ODR = 100 Hz(0x07)
+    WriteData(Acc_addr,0x11,0x00);//Normal mode, Sleep duration = 2ms(0x00)
+    WriteData(Gyro_addr,GYRO_ret,0xb6);
+    WriteData(Gyro_addr,GYRO_range,0x01);// 1000
+    WriteData(Gyro_addr,0x10,0x07);// 100Hz
+		WriteData(Gyro_addr,0x11,0x00);// Normal mode, Sleep duration = 2ms(0x00)
+		WriteData(Gyro_addr,0x13,0x08);
+		WriteData(Mag_addr,MAG_ret,0x81);
+//    WriteData(Mag_addr,MAG_ret,0x83);// Soft reset(0x83)
+//	  WriteData(Mag_addr,MAG_ret,0x01);//  Soft reset
+//    WriteData(Mag_addr,0x4c,0x38);// Normal Mode, ODR = 10 Hz
+//    WriteData(Mag_addr,0x4e,0x84);// X, Y, Z-Axis enabled(0x84)
+//    WriteData(Mag_addr,0x51,0x04);// No. of Repetitions for X-Y Axis = 9(0x04)
+//    WriteData(Mag_addr,0x52,0x0F);// No. of Repetitions for Z-Axis = 15(0x0F)
+	WriteData(Mag_addr, 0x4c, 0x00); //00000000		将mag由sleep mode切换到normal mode（active）
+}
+
+void Initial_Timer3(void)
+{
+    TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2 | RCC_APB1Periph_TIM3, ENABLE);
+    /* TIM2 configuration*/
+    /* Time Base configuration 基本配置 配置定时器的时基单元*/
+    TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);
+    TIM_TimeBaseStructure.TIM_Period = 0xffff; //自动重装值
+    TIM_TimeBaseStructure.TIM_Prescaler = 0x0;
+    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM2, &TIM_TimeBaseStructure);
+
+    TIM_PrescalerConfig(TIM2, 0, TIM_PSCReloadMode_Update);
+    /* Disable the TIM2 Update event */
+    TIM_UpdateDisableConfig(TIM2, ENABLE);
+    /* ----------------------TIM2 Configuration as slave for the TIM3 ----------*/
+    /* Select the TIM2 Input Trigger: TIM3 TRGO used as Input Trigger for TIM2*/
+    TIM_SelectInputTrigger(TIM2, TIM_TS_ITR2);
+    /* Use the External Clock as TIM2 Slave Mode */
+    TIM_SelectSlaveMode(TIM2, TIM_SlaveMode_External1);
+    /* Enable the TIM2 Master Slave Mode */
+    TIM_SelectMasterSlaveMode(TIM2, TIM_MasterSlaveMode_Enable);
+    TIM_ARRPreloadConfig(TIM2, ENABLE);
+    /* 定时器配置:
+    1.设置定时器最大计数值 50000
+    2.设置时钟分频系数：TIM_CKD_DIV1
+    3. 设置预分频：  1Mhz/50000= 1hz
+    4.定时器计数模式  向上计数模式
+    */
+    TIM_TimeBaseStructure.TIM_Period = 0xffff;
+    TIM_TimeBaseStructure.TIM_Prescaler = 72;	 //1M 的时钟
+    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    //应用配置到TIM3
+    TIM_TimeBaseInit(TIM3, &TIM_TimeBaseStructure);
+    // 使能TIM3重载寄存器ARR
+    TIM_ARRPreloadConfig(TIM3, ENABLE);
+
+    TIM_SelectSlaveMode(TIM3, TIM_SlaveMode_Reset);
+    TIM_UpdateRequestConfig(TIM3, TIM_UpdateSource_Regular);
+    /* ----------------------TIM3 Configuration as Master for the TIM2 -----------*/
+    /* Use the TIM3 Update event  as TIM3 Trigger Output(TRGO) */
+    TIM_SelectOutputTrigger(TIM3, TIM_TRGOSource_Update);
+    /* Enable the TIM3 Master Slave Mode */
+    TIM_SelectMasterSlaveMode(TIM3, TIM_MasterSlaveMode_Enable);
+
+    //启动定时器
+    TIM_Cmd(TIM3, ENABLE);
+    TIM_Cmd(TIM2, ENABLE);
+}
+
+void IMU_init_1(void)
+{	 
+	IMU_Init();
+	delay_ms(50);
+	IMU_Init();
+	Initial_Timer3();
+	//initialize quaternion
+  	q0 = 1.0f;  //初始化四元数
+  	q1 = 0.0f;
+  	q2 = 0.0f;
+  	q3 = 0.0f;
+  	exInt1 = 0.0;
+  	eyInt1 = 0.0;
+  	ezInt1 = 0.0;
+  	lastUpdate = micros();//更新时间
+  	now = micros();
+}
+void MPU6050_getlastMotion6(int16_t* ax, int16_t* ay, 
+		int16_t* az, int16_t* gx, int16_t* gy, int16_t* gz)
+{
+	*ax  =MPU6050_FIFO[0][10];
+	*ay  =MPU6050_FIFO[1][10];
+	*az = MPU6050_FIFO[2][10];
+	*gx  =MPU6050_FIFO[3][10]-Gx_offset;
+	*gy = MPU6050_FIFO[4][10]-Gy_offset;
+	*gz = MPU6050_FIFO[5][10]-Gz_offset;
+}
+// Fast inverse square-root
+/**************************实现函数********************************************
+*函数原型:	   float invSqrt(float x)
+*功　　能:	   快速计算 1/Sqrt(x)
+输入参数： 要计算的值
+输出参数： 结果
+*******************************************************************************/
+float invSqrt(float x) {
+    float halfx = 0.5f * x;
+    float y = x;
+    long i = *(long*)&y;
+    i = 0x5f3759df - (i>>1);
+    y = *(float*)&i;
+    y = y * (1.5f - (halfx * y * y));
+    return y;
+}
+/**************************实现函数********************************************
+*函数原型:	  void HMC58X3_mgetValues(float *arry)
+*功　　能:	   读取 校正后的 磁力计ADC值
+输入参数：    输出数组指针
+输出参数：  无
+*******************************************************************************/
+void HMC58X3_mgetValues(float *arry)
+{
+
+   int16_t xr,yr,zr;
+  HMC58X3_getRaw(&xr, &yr, &zr);
+  arry[0]= HMC5883_lastx=(float)(xr);
+  arry[1]= HMC5883_lasty=(float)(yr);
+  arry[2]= HMC5883_lastz=(float)(zr);
+}
+
+/**************************实现函数********************************************
+*函数原型:		uint32_t micros(void)
+*功　　能:	  读取系统运行的时间 ，返回单位为us 的时间数。
+输入参数：无
+输出参数：处理器当前时间，从上电开始计时  单位 us
+*******************************************************************************/
+uint32_t micros(void)
+{
+    uint32_t temp=0 ;
+    temp = TIM2->CNT;//读高16位时间
+    temp = temp<<16;
+    temp += TIM3->CNT;//读低16位时间
+    return temp;
+}
+int16_t MPU6050_Lastax,MPU6050_Lastay,MPU6050_Lastaz
+				,MPU6050_Lastgx,MPU6050_Lastgy,MPU6050_Lastgz;
+void BMX055_getMotion6(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, int16_t* gz)
+	{
+		ReadData(Gyro_addr,GYRO_XL,BMX055_GBUF1,6);//16位
+	  ReadData(Acc_addr,ACC_XL,BMX055_ABUF1,6);  //第一个为IIC地址，第二个为寄存器地址
+
+    
+		MPU6050_Lastax=(BMX055_ABUF1[1] * 256 + (BMX055_ABUF1[0] & 0xF0)) / 16;
+	    MPU6050_Lastay=(BMX055_ABUF1[3] * 256 + (BMX055_ABUF1[2] & 0xF0)) / 16;
+	    MPU6050_Lastaz=(BMX055_ABUF1[5] * 256 + (BMX055_ABUF1[4] & 0xF0)) / 16;
+		//跳过温度ADC
+	    MPU6050_Lastgx=(BMX055_GBUF1[1] * 256 + (BMX055_GBUF1[0]));
+	    MPU6050_Lastgy=(BMX055_GBUF1[3] * 256 + (BMX055_GBUF1[2]));
+	    MPU6050_Lastgz=(BMX055_GBUF1[5] * 256 + (BMX055_GBUF1[4]));
+		MPU6050_newValues(MPU6050_Lastax,MPU6050_Lastay,MPU6050_Lastaz
+			,MPU6050_Lastgx,MPU6050_Lastgy,MPU6050_Lastgz);
+		*ax  =MPU6050_FIFO[0][10];
+		*ay  =MPU6050_FIFO[1][10];
+		*az = MPU6050_FIFO[2][10];
+		*gx  =MPU6050_FIFO[3][10]-Gx_offset;
+		*gy = MPU6050_FIFO[4][10]-Gy_offset;
+		*gz = MPU6050_FIFO[5][10]-Gz_offset;
+		
+
+}
+/**************************实现函数********************************************
+*函数原型:	   void IMU_getValues(float * values)
+*功　　能:	 读取加速度 陀螺仪 磁力计 的当前值
+输入参数： 将结果存放的数组首地址
+输出参数：没有
+*******************************************************************************/
+void IMU_getValues(float * values)
+	{
+		
+    
+    int i;
+			//读取加速度和陀螺仪的当前ADC
+    
+		BMX055_getMotion6(&accgyroval[0], &accgyroval[1], &accgyroval[2], &accgyroval[3], &accgyroval[4], &accgyroval[5]);
+    for(i = 0; i<6; i++) {
+        if(i < 3) {
+            values[i] = (float) accgyroval[i];
+        }
+        else {
+            values[i] = ((float) accgyroval[i]) / 32.8f; //转成度每秒
+            //这里已经将量程改成了 1000度每秒  32.8 对应 1度每秒
+        }
+    }
+    HMC58X3_mgetValues(&values[6]);	//读取磁力计的ADC值
+}
+/**************************实现函数********************************************
+*函数原型:	   void IMU_AHRSupdate
+*功　　能:	 更新AHRS 更新四元数
+输入参数： 当前的测量值。
+输出参数：没有
+*******************************************************************************/
+#define Kp 1.0f   // proportional gain governs rate of convergence to accelerometer/magnetometer
+#define Ki 0.53f   // integral gain governs rate of convergence of gyroscope biases
+
+void IMU_AHRSupdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz) {
+    float norm;
+    float hx, hy, hz, bx, bz;
+    float vx, vy, vz, wx, wy, wz;
+    float ex, ey, ez,halfT;
+
+    // 先把这些用得到的值算好
+    float q0q0 = q0*q0;
+    float q0q1 = q0*q1;
+    float q0q2 = q0*q2;
+    float q0q3 = q0*q3;
+    float q1q1 = q1*q1;
+    float q1q2 = q1*q2;
+    float q1q3 = q1*q3;
+    float q2q2 = q2*q2;
+    float q2q3 = q2*q3;
+    float q3q3 = q3*q3;
+
+    now = micros();  //读取时间
+    if(now<lastUpdate) { //定时器溢出过了。
+        halfT =  ((float)(now + (0xffff- lastUpdate)) / 2000000.0f);
+    }
+    else	{
+        halfT =  ((float)(now - lastUpdate) / 2000000.0f);
+    }
+    lastUpdate = now;	//更新时间
+
+    norm = invSqrt(ax*ax + ay*ay + az*az);
+    ax = ax * norm;
+    ay = ay * norm;
+    az = az * norm;
+
+    norm = invSqrt(mx*mx + my*my + mz*mz);
+    mx = mx * norm;
+    my = my * norm;
+    mz = mz * norm;
+
+    // compute reference direction of flux
+    hx = 2*mx*(0.5f - q2q2 - q3q3) + 2*my*(q1q2 - q0q3) + 2*mz*(q1q3 + q0q2);
+    hy = 2*mx*(q1q2 + q0q3) + 2*my*(0.5f - q1q1 - q3q3) + 2*mz*(q2q3 - q0q1);
+    hz = 2*mx*(q1q3 - q0q2) + 2*my*(q2q3 + q0q1) + 2*mz*(0.5f - q1q1 - q2q2);
+    bx = sqrt((hx*hx) + (hy*hy));
+    bz = hz;
+
+    // estimated direction of gravity and flux (v and w)
+    vx = 2*(q1q3 - q0q2);
+    vy = 2*(q0q1 + q2q3);
+    vz = q0q0 - q1q1 - q2q2 + q3q3;
+    wx = 2*bx*(0.5 - q2q2 - q3q3) + 2*bz*(q1q3 - q0q2);
+    wy = 2*bx*(q1q2 - q0q3) + 2*bz*(q0q1 + q2q3);
+    wz = 2*bx*(q0q2 + q1q3) + 2*bz*(0.5 - q1q1 - q2q2);
+
+    // error is sum of cross product between reference direction of fields and direction measured by sensors
+    ex = (ay*vz - az*vy) + (my*wz - mz*wy);
+    ey = (az*vx - ax*vz) + (mz*wx - mx*wz);
+    ez = (ax*vy - ay*vx) + (mx*wy - my*wx);
+		
+
+    if(ex != 0.0f && ey != 0.0f && ez != 0.0f)
+    {
+        exInt1 = exInt1 + ex * Ki * halfT;
+        eyInt1 = eyInt1 + ey * Ki * halfT;
+        ezInt1 = ezInt1 + ez * Ki * halfT;
+
+        // adjusted gyroscope measurements
+        gx = gx + Kp*ex + exInt1;
+        gy = gy + Kp*ey + eyInt1;
+        gz = gz + Kp*ez + ezInt1;
+    }
+
+    // integrate quaternion rate and normalise
+    q0 = q0 + (-q1*gx - q2*gy - q3*gz)*halfT;
+    q1 = q1 + (q0*gx + q2*gz - q3*gy)*halfT;
+    q2 = q2 + (q0*gy - q1*gz + q3*gx)*halfT;
+    q3 = q3 + (q0*gz + q1*gy - q2*gx)*halfT;
+
+    // normalise quaternion
+    norm = invSqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+    q0 = q0 * norm;
+    q1 = q1 * norm;
+    q2 = q2 * norm;
+    q3 = q3 * norm;
+}
+/**************************实现函数********************************************
+*函数原型:	   void IMU_getQ(float * q)
+*功　　能:	 更新四元数 返回当前的四元数组值
+输入参数： 将要存放四元数的数组首地址
+输出参数：没有
+*******************************************************************************/
+float mygetqval[9];	//用于存放传感器转换结果的数组
+void IMU_getQ(float * q)
+{
+
+    IMU_getValues(mygetqval);
+    //将陀螺仪的测量值转成弧度每秒
+    //加速度和磁力计保持 ADC值　不需要转换
+    IMU_AHRSupdate(mygetqval[3] * M_PI/180, mygetqval[4] * M_PI/180, mygetqval[5] * M_PI/180,
+                   mygetqval[0]*0.009573, mygetqval[1]*0.009573, mygetqval[2]*0.009573, mygetqval[6]*0.6, mygetqval[7]*0.6, mygetqval[8]*0.3);
+
+    q[0] = q0; //返回当前值
+    q[1] = q1;
+    q[2] = q2;
+    q[3] = q3;
+}
+/**************************实现函数********************************************
+*函数原型:	   void IMU_getYawPitchRoll(float * angles)
+*功　　能:	 更新四元数 返回当前解算后的姿态数据
+输入参数： 将要存放姿态角的数组首地址
+输出参数：没有
+*******************************************************************************/
+void IMU_getYawPitchRoll(float * angles)
+{
+  float q[4]; //　四元数
+  volatile float gx=0.0, gy=0.0, gz=0.0; //估计重力方向
+  IMU_getQ(q); //更新全局四元数
+  
+  angles[0] = -atan2(2 * q[1] * q[2] + 2 * q[0] * q[3], -2 * q[2]*q[2] - 2 * q[3] * q[3] + 1)* 180/M_PI; // yaw
+  angles[1] = -asin(-2 * q[1] * q[3] + 2 * q[0] * q[2])* 180/M_PI; // pitch
+  angles[2] = atan2(2 * q[2] * q[3] + 2 * q[0] * q[1], -2 * q[1] * q[1] - 2 * q[2] * q[2] + 1)* 180/M_PI; // roll
+  //if(angles[0]<0)angles[0]+=360.0f;  //将 -+180度  转成0-360度
+}

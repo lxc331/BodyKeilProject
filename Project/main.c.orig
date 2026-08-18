@@ -1,0 +1,346 @@
+#include "stm32f10x.h"
+//#include <stm32f10x_lib.h>
+#include "sys.h"
+#include "delay.h"
+#include "usart.h"
+#include "myiic.h"
+#include "IMU.h"
+#include "UARTs.h"
+#include "UART2.h"
+#define REIMU  0x01 //上传解算的姿态数据
+#define REMOV  0x02	//上传传感器的输出
+#define REHMC  0x03	//上传磁力计的标定值
+#define Upload_Speed  20   //数据上传速度  单位 Hz
+
+#define upload_time (1000000/Upload_Speed)/2  //计算上传的时间。单位为us
+u8 state= REIMU;
+float gyroBias[3] = {0, 0, 0}, accelBias[3] = {0, 0, 0}, magBias[3] = {0, 0, 0};  // Bias corrections for gyro, accelerometer, mag
+void get_acc(void);
+void get_gyro(void);
+void get_mag(float *magData);
+void fastcompaccelBMX055(float * dest1);
+int L;
+uint32_t system_micrsecond,now_system_time;
+int i;
+int16_t MBX055_Gyro[3],MBX055_Acc[3],MBX055_Mag[3];
+void MPU6050ReadAcc(T_int16_xyz *accData);
+void MPU6050ReadGyro(T_int16_xyz *gyroData);
+extern float  angles[3];
+u8  BMX055_ABUF[6];//缓存
+u8	BMX055_GBUF[6];
+u8	BMX055_MBUF[6];
+float Acc_dat[3];
+float Gyro_dat[3];
+float Mag_dat[3];
+float Tem_dat;
+float ypr[3];//yaw pitch roll
+extern float norm;
+extern float mygetqval[9];	//用于存放传感器转换结果的数组
+void TIM4_Init(u16 pre, u16 psc)
+{
+    TIM_TimeBaseInitTypeDef TIM_TimeBaseInitStructure;
+    NVIC_InitTypeDef NVIC_InitStructure;
+
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4,ENABLE);
+    TIM_TimeBaseInitStructure.TIM_Period=pre;
+    TIM_TimeBaseInitStructure.TIM_Prescaler=psc;
+    TIM_TimeBaseInitStructure.TIM_ClockDivision=TIM_CKD_DIV1;
+    TIM_TimeBaseInitStructure.TIM_CounterMode=TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM4,&TIM_TimeBaseInitStructure);
+
+    //更新中断信号，配合中断信号产生中断。
+    TIM_ITConfig(TIM4,TIM_IT_Update,ENABLE);
+    TIM_ClearITPendingBit(TIM4,TIM_IT_Update);
+    //设置优先级
+    NVIC_InitStructure.NVIC_IRQChannel=TIM4_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=2;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority=3;
+    NVIC_InitStructure.NVIC_IRQChannelCmd=ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
+    //开启定时器
+    TIM_Cmd(TIM4,ENABLE);
+
+}
+int main(void)
+{
+    int16_t Math_hz=0;
+    u8 temp = 0;
+    TIM4_Init(5000,71);
+//	Stm32_Clock_Init(9);		//8M外部晶振，9倍频
+    SysTick_Init(72);
+    Initial_UART2(115200);
+
+    uart_init(72,115200);		//serial init baud
+    IIC_Init();
+    IMU_init_1();
+//    printf("Inited , Start~\n\r");	// \n\r 换行，回车
+//    //读ID
+//    ReadData(Acc_addr,ACC_ID,&temp,8);
+//    if(temp == 0xfa)
+//        printf("The ACC is ok.\n\r");
+//    else
+//        printf("Error,the ACC_ID is : 0x%x\n\r",temp);
+
+//    ReadData(Gyro_addr,GYRO_ID,&temp,8);
+//    if(temp == 0x0f)
+//        printf("The GYRO is ok.\n\r");
+//    else
+//        printf("Error,the GYRO_ID is : 0x%x\n\r",temp);
+
+//    ReadData(Mag_addr,MAG_ID,&temp,8);
+//    if(temp == 0x32)
+//        printf("The MAG is ok.\n\r");
+//    else
+//        printf("Error,the MAG_ID is : 0x%x\n\r",temp);
+    system_micrsecond=micros();
+		fastcompaccelBMX055(accelBias);
+    while(1)
+    {
+
+        if(IsGyroOffsetReset==0)
+        {
+
+            get_acc();
+            get_gyro();
+//            get_mag();
+            IMU_AHRSupdate(Gyro_dat[0]/32.8f * M_PI/180, Gyro_dat[1]/32.8f * M_PI/180, Gyro_dat[2]/32.8f * M_PI/180,
+                           Acc_dat[0]*0.0096, Acc_dat[1]*0.0096, Acc_dat[2]*0.0096, Mag_dat[1], -Mag_dat[0], Mag_dat[2]);
+            Math_hz++;//解算次数++
+
+//					 UART2_ReportIMU((int16_t)(angles[0]*10.0),(int16_t)(angles[1]*10.0),
+//                               (int16_t)(angles[2]*10.0),0,0,00,Math_hz*Upload_Speed);
+            //	delay_ms(10);
+
+            now_system_time=micros();
+            if((now_system_time-system_micrsecond)>upload_time)
+            {
+//					printf("%f\n",angles[0]);
+//					printf("%f %f %f\n",Gyro_dat[0]/32.8f * M_PI/180,Gyro_dat[1]/32.8f * M_PI/180,Gyro_dat[2]/32.8f * M_PI/180);
+//						printf("%f %f %f\n",angles[0],angles[1],angles[2]);
+//					UART2_siyuan(q[0],q[1],q[2],q[3]);
+                UART2_Oula(angles[0],angles[1],angles[2]);
+
+//					UART2_Unity(q0,q1,q2,q3);
+
+//				  UART2_norm(norm);
+//            switch(state)
+//            {
+//            case REIMU:
+//            {
+//
+//                UART2_ReportIMU((int16_t)(angles[0]*10.0),(int16_t)(angles[1]*10.0),
+//                                (int16_t)(angles[2]*10.0),0,0,00,Math_hz*Upload_Speed);
+//                //Math_hz=0;
+//                state = REMOV;//更改状态。
+//                break;
+//            }
+//            case REMOV:
+//            {
+
+//               // UART2_ReportMotion(Acc_dat[0],Acc_dat[1],Acc_dat[2],Gyro_dat[0],Gyro_dat[1],Gyro_dat[2],Mag_dat[1],-Mag_dat[0],Mag_dat[2]);
+//                state = REIMU;
+//            }
+//            break;
+
+//            }
+
+                system_micrsecond=micros();//取系统时间单位us
+
+            }
+
+
+//        printf("%f %f %f ",Acc_dat[0],Acc_dat[1],Acc_dat[2]);
+//		printf("%f %f %f " ,Gyro_dat[0],Gyro_dat[1],Gyro_dat[2]);
+//			printf("%f %f %f\n",Mag_dat[0],Mag_dat[1],Mag_dat[2]);
+
+
+        }
+    }
+}
+
+
+
+void TIM4_IRQHandler(void)
+{
+    if(TIM_GetITStatus(TIM4,TIM_IT_Update)==1)
+    {
+
+//        LED2=~LED2;
+        if(IsGyroOffsetReset)
+        {
+            GyroOffset_init();             ///////零偏矫正过程中不进行姿态结算，并保证姿态模块静止
+        }
+
+
+
+
+    }
+    TIM_ClearITPendingBit(TIM4,TIM_IT_Update);
+}
+void fastcompaccelBMX055(float * dest1)
+{
+	uint8_t compx,compy,compz;
+	uint8_t c;
+    WriteData(Acc_addr, BMX055_ACC_OFC_CTRL, 0x80); // set all accel offset compensation registers to zero
+//设置所有加速偏移补偿寄存器为零
+    WriteData(Acc_addr, BMX055_ACC_OFC_SETTING, 0x40);  // set offset targets to 0, 0, and +1 g for x, y, z axes
+//设置x, y, z轴的偏移目标为0,0，和+1 g
+    WriteData(Acc_addr, BMX055_ACC_OFC_CTRL, 0x20); // calculate x-axis offset
+//计算x轴偏移量
+
+     ReadData(Acc_addr, BMX055_ACC_OFC_CTRL,&c,1);
+    while(!(c & 0x10))
+    {   // check if fast calibration complete
+        //检查快速校准是否完成
+        ReadData(Acc_addr, BMX055_ACC_OFC_CTRL,&c,1);
+        delay_ms(10);
+    }
+    WriteData(Acc_addr, BMX055_ACC_OFC_CTRL, 0x40); // calculate y-axis offset
+//计算y轴偏移量
+
+    
+		ReadData(Acc_addr, BMX055_ACC_OFC_CTRL,&c,1);
+    while(!(c & 0x10))
+    {   // check if fast calibration complete
+        ReadData(Acc_addr, BMX055_ACC_OFC_CTRL,&c,1);
+        delay_ms(10);
+    }
+    WriteData(Acc_addr, BMX055_ACC_OFC_CTRL, 0x60); // calculate z-axis offset
+
+   ReadData(Acc_addr, BMX055_ACC_OFC_CTRL,&c,1);
+    while(!(c & 0x10))
+    {   // check if fast calibration complete
+         ReadData(Acc_addr, BMX055_ACC_OFC_CTRL,&c,1);
+        delay_ms(10);
+    }
+
+    ReadData(Acc_addr, BMX055_ACC_OFC_OFFSET_X,&compx,1);
+    ReadData(Acc_addr, BMX055_ACC_OFC_OFFSET_Y,&compy,1);
+		ReadData(Acc_addr, BMX055_ACC_OFC_OFFSET_Z,&compz,1);
+
+    dest1[0] = (float) compx/128.0f; // accleration bias in g
+    dest1[1] = (float) compy/128.0f; // accleration bias in g
+    dest1[2] = (float) compz/128.0f; // accleration bias in g
+}
+void get_acc(void)
+{
+    //acc
+    ReadData(Acc_addr,ACC_XL,BMX055_ABUF,6);  //第一个为IIC地址，第二个为寄存器地址
+		if((BMX055_ABUF[0] & 0x01) && (BMX055_ABUF[2] & 0x01) && (BMX055_ABUF[4] & 0x01))
+		{  
+			for(i = 0; i < 3; i ++) //0 1 2  0 1 2 3 4 5 12位
+			{
+					Acc_dat[i]=(float)((int16_t)((BMX055_ABUF[2*i+1] << 8) | BMX055_ABUF[2*i]) >> 4);
+
+
+			}
+		}
+
+		Acc_dat[0]+=accelBias[0];
+		Acc_dat[1]+=accelBias[1];
+		Acc_dat[2]+=accelBias[2];
+	
+}
+void get_gyro(void)
+{
+    //gyro
+    ReadData(Gyro_addr,GYRO_XL,BMX055_GBUF,6);//16位
+    for(i = 0; i < 3; i ++) //0 1 2  0 1 2 3 4 5
+    {
+        Gyro_dat[i]=(float)((int16_t)((BMX055_GBUF[2*i+1] << 8) | BMX055_GBUF[2*i]));
+
+
+    }
+    Gyro_dat[0]=Gyro_dat[0]-GyroOffset.Xdata;
+    Gyro_dat[1]=Gyro_dat[1]-GyroOffset.Ydata;
+    Gyro_dat[2]=Gyro_dat[2]-GyroOffset.Zdata;
+
+
+}
+void get_mag(float * magData)
+{
+	uint8_t rawData[8]; 
+    //mag
+    ReadData(Mag_addr,MAG_XL,rawData,6);
+	if(rawData[6]&0x01)
+	{
+    for(i = 0; i < 2; i ++) //0 1   0 1 2 3  13位
+    {
+        magData[i] =(float)((int16_t)((rawData[2*i+1] << 8) | rawData[2*i]) >> 3) ;
+
+//				Mag_dat[i]=(float)MBX055_Mag[i];
+//        if(Mag_dat[i]> 4095)
+//        {
+//            Mag_dat[i] -= 8192;
+//            Mag_dat[i]=Mag_dat[i]*MagxySen;
+//        }
+//        else
+//        {
+//            Mag_dat[i]=Mag_dat[i]*MagxySen;
+//        }
+
+    }
+
+    magData[2]= (float)((int16_t)((rawData[5] << 8) | rawData[4]) >> 1) ;//15位
+
+//		 Mag_dat[2]=(float)MBX055_Mag[2];
+//    if(Mag_dat[2]> 16383)
+//    {
+//        Mag_dat[2] -= 32768;
+//        Mag_dat[2]=Mag_dat[2]*MagzSen;
+//    }
+//    else
+//    {
+//        Mag_dat[2]=Mag_dat[2]*MagzSen;
+//    }
+    Mag_dat[0]=Mag_dat[0]*0.3173828;
+    Mag_dat[1]=Mag_dat[1]*0.3173828;
+    Mag_dat[2]=Mag_dat[2]*0.1525879;
+    Mag_dat[0]=Mag_dat[0]-MagOffset.Xdata;
+    Mag_dat[1]=Mag_dat[1]-MagOffset.Ydata;
+    Mag_dat[2]=Mag_dat[2]-MagOffset.Zdata;
+    Mag_dat[0]=Mag_dat[0]*0.7761+Mag_dat[1]*(-0.0009)+Mag_dat[2]*0.0176;
+    Mag_dat[1]=Mag_dat[0]*(-0.009)+Mag_dat[1]*0.7371+Mag_dat[2]*(-0.0297);
+    Mag_dat[2]=Mag_dat[0]*0.0176+Mag_dat[1]*(-0.0297)+Mag_dat[2]*1.7495;;
+	}
+
+
+}
+ void magcalBMX055(float * dest1)
+    {
+        uint16_t ii = 0, sample_count = 0;
+        int32_t mag_bias[3] = {0, 0, 0};
+        int16_t mag_max[3] = {0, 0, 0}, mag_min[3] = {0, 0, 0};
+ 
+        // ## "Mag Calibration: Wave device in a figure eight until done!" ##
+        //wait(4);
+ 
+        sample_count = 48;
+        for(ii = 0; ii < sample_count; ii++)
+        {
+            int16_t mag_temp[3] = {0, 0, 0};
+           
+						get_mag(mag_temp);
+            for (int jj = 0; jj < 3; jj++)
+            {
+                if(mag_temp[jj] > mag_max[jj]) mag_max[jj] = mag_temp[jj];
+                if(mag_temp[jj] < mag_min[jj]) mag_min[jj] = mag_temp[jj];
+            }
+            delay_ms(105);  // at 10 Hz ODR, new mag data is available every 100 ms
+        }
+ 
+        mag_bias[0] = (mag_max[0] + mag_min[0])/2;  // get average x mag bias in counts
+        mag_bias[1] = (mag_max[1] + mag_min[1])/2;  // get average y mag bias in counts
+        mag_bias[2] = (mag_max[2] + mag_min[2])/2;  // get average z mag bias in counts
+ 
+        // save mag biases in G for main program
+        dest1[0] = (float) mag_bias[0]*mRes;
+        dest1[1] = (float) mag_bias[1]*mRes;
+        dest1[2] = (float) mag_bias[2]*mRes;
+ 
+        // ## "Mag Calibration done!" ##
+    }
+
+
+
