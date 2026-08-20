@@ -1,0 +1,7 @@
+本工程可在《SHT10+DS18B20可休眠温湿度采集方案》的传感器底板上运行。
+
+请先按温湿度采集方案搭建IAR for STM8 V1.30平台，放置好库文件，并完成SHT10Sensor工程文件的调试。而后将本工程文件夹放在与SHT10Sensor文件夹平行的位置。也就是最终路径为
+C:\Program Files (x86)\IAR Systems\Embedded Workbench 6.0\stm8\projects\ThroughputSample
+即可进行调试测试。
+
+主机端接电脑，配置环境、串口软件请参考《USB转Zigbee串口透传方案》。请使用我们提供的串口软件测试。
