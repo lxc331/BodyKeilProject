@@ -12,12 +12,20 @@ UART1ͨ�� ��API
 
 #include "UART2.h"
 
-//uart reicer flag
-#define b_uart_head  0x80
-#define b_rx_over    0x40
+#define UART2_LINK_RX_BUFFER_SIZE 64u
+#define UART2_LINK_RX_BUFFER_MASK (UART2_LINK_RX_BUFFER_SIZE - 1u)
+#define UART2_LINK_MAX_PAYLOAD 8u
+#define UART2_LINK_MAX_FRAME_SIZE (7u + UART2_LINK_MAX_PAYLOAD)
+#define UART2_LINK_PROTOCOL_VERSION 1u
 
-// USART Receiver buffer
-#define RX_BUFFER_SIZE 100
+static volatile uint8_t s_ucLinkRxBuffer[UART2_LINK_RX_BUFFER_SIZE];
+static volatile uint8_t s_ucLinkRxWriteIndex = 0u;
+static volatile uint8_t s_ucLinkRxReadIndex = 0u;
+static volatile uint32_t s_uiLinkRxOverflowCount = 0u;
+static uint32_t s_uiLinkInvalidFrameCount = 0u;
+static uint8_t s_ucLinkFrame[UART2_LINK_MAX_FRAME_SIZE];
+static uint8_t s_ucLinkFrameIndex = 0u;
+static uint8_t s_ucLinkExpectedFrameSize = 0u;
 
 u8 U2TxBuffer[258];
 u8 U2TxCounter=0;
@@ -372,6 +380,125 @@ static uint16_t UART2_Crc16Ccitt(const uint8_t *data, uint16_t length)
     return crc;
 }
 
+static uint8_t UART2_TryReadRxByte(uint8_t *value)
+{
+    uint8_t read_index;
+
+    __disable_irq();
+    read_index = s_ucLinkRxReadIndex;
+    if (read_index == s_ucLinkRxWriteIndex)
+    {
+        __enable_irq();
+        return 0u;
+    }
+    *value = s_ucLinkRxBuffer[read_index];
+    s_ucLinkRxReadIndex = (uint8_t)((read_index + 1u) & UART2_LINK_RX_BUFFER_MASK);
+    __enable_irq();
+    return 1u;
+}
+
+static void UART2_ResetLinkFrameParser(void)
+{
+    s_ucLinkFrameIndex = 0u;
+    s_ucLinkExpectedFrameSize = 0u;
+}
+
+uint8_t UART2_TryReadLinkCommand(UART2_LinkCommand *command)
+{
+    uint8_t value;
+
+    if (command == 0)
+        return 0u;
+
+    while (UART2_TryReadRxByte(&value))
+    {
+        if ((s_ucLinkFrameIndex == 0u) && (value != 0xA5u))
+            continue;
+
+        if ((s_ucLinkFrameIndex == 1u) && (value != 0x5Au))
+        {
+            s_ucLinkFrameIndex = (value == 0xA5u) ? 1u : 0u;
+            continue;
+        }
+
+        s_ucLinkFrame[s_ucLinkFrameIndex++] = value;
+
+        if (s_ucLinkFrameIndex == 5u)
+        {
+            uint8_t payload_length = s_ucLinkFrame[4];
+            if ((s_ucLinkFrame[2] != UART2_LINK_PROTOCOL_VERSION) ||
+                (payload_length > UART2_LINK_MAX_PAYLOAD))
+            {
+                s_uiLinkInvalidFrameCount++;
+                UART2_ResetLinkFrameParser();
+                continue;
+            }
+            s_ucLinkExpectedFrameSize = (uint8_t)(7u + payload_length);
+        }
+
+        if ((s_ucLinkExpectedFrameSize != 0u) &&
+            (s_ucLinkFrameIndex == s_ucLinkExpectedFrameSize))
+        {
+            uint16_t received_crc = (uint16_t)s_ucLinkFrame[s_ucLinkExpectedFrameSize - 2u] |
+                                    ((uint16_t)s_ucLinkFrame[s_ucLinkExpectedFrameSize - 1u] << 8);
+            uint16_t calculated_crc = UART2_Crc16Ccitt(s_ucLinkFrame,
+                                                       (uint16_t)(s_ucLinkExpectedFrameSize - 2u));
+            uint8_t link_command = s_ucLinkFrame[3];
+            uint8_t payload_length = s_ucLinkFrame[4];
+
+            if (received_crc != calculated_crc)
+            {
+                s_uiLinkInvalidFrameCount++;
+                UART2_ResetLinkFrameParser();
+                continue;
+            }
+
+            if ((link_command == UART2_LINK_COMMAND_CONFIG_SYNC) && (payload_length == 5u))
+            {
+                uint8_t transmit_rate_hz = s_ucLinkFrame[5];
+                if ((transmit_rate_hz < 1u) || (transmit_rate_hz > 10u))
+                {
+                    s_uiLinkInvalidFrameCount++;
+                    UART2_ResetLinkFrameParser();
+                    continue;
+                }
+
+                command->Command = link_command;
+                command->TransmitRateHz = transmit_rate_hz;
+                command->SyncToken = (uint32_t)s_ucLinkFrame[6] |
+                                     ((uint32_t)s_ucLinkFrame[7] << 8) |
+                                     ((uint32_t)s_ucLinkFrame[8] << 16) |
+                                     ((uint32_t)s_ucLinkFrame[9] << 24);
+                UART2_ResetLinkFrameParser();
+                return 1u;
+            }
+
+            if ((link_command == UART2_LINK_COMMAND_PAUSE) && (payload_length == 0u))
+            {
+                command->Command = link_command;
+                command->TransmitRateHz = 0u;
+                command->SyncToken = 0u;
+                UART2_ResetLinkFrameParser();
+                return 1u;
+            }
+
+            s_uiLinkInvalidFrameCount++;
+            UART2_ResetLinkFrameParser();
+        }
+    }
+    return 0u;
+}
+
+uint32_t UART2_GetLinkRxOverflowCount(void)
+{
+    return s_uiLinkRxOverflowCount;
+}
+
+uint32_t UART2_GetLinkInvalidFrameCount(void)
+{
+    return s_uiLinkInvalidFrameCount;
+}
+
 static void UART2_WriteU32Le(uint8_t *target, uint32_t value)
 {
     target[0] = (uint8_t)(value & 0xFF);
@@ -386,7 +513,8 @@ static void UART2_WriteU32Le(uint8_t *target, uint32_t value)
  * quaternion w,x,y,z (16 bytes) | version=2 | flags |
  * source sequence | sender tick ms | stable hardware id | CRC16-CCITT.
  * flags: bit0=metadata, bit1=hardware-derived real-time clock,
- * bit2=main system clock is in the expected 72 MHz range.
+ * bit2=main system clock is in the expected 72 MHz range,
+ * bit3=latest-only slotted transmission, bit4=Unity schedule synchronized.
  */
 void UART2_siyuan_v2(uint8_t device_id,
                      uint32_t hardware_id,
@@ -736,53 +864,25 @@ void UART2_ReportMotion(int16_t ax,int16_t ay,int16_t az,int16_t gx,int16_t gy,i
 	UART2_Put_Char(0xaa);
 }
 
-volatile unsigned char rx_buffer[RX_BUFFER_SIZE];
-volatile unsigned char rx_wr_index;
-volatile unsigned char RC_Flag;
-//------------------------------------------------------
 void USART2_IRQHandler(void)
 {
-	unsigned char ucTemp;
+	uint8_t value;
+	uint8_t next_write_index;
 	if(USART_GetITStatus(USART2, USART_IT_RXNE) != RESET)
 	{
-		ucTemp = USART_ReceiveData(USART2);
-		//CopeCmdData(ucTemp);
+		value = (uint8_t)USART_ReceiveData(USART2);
+		next_write_index = (uint8_t)((s_ucLinkRxWriteIndex + 1u) & UART2_LINK_RX_BUFFER_MASK);
+		if (next_write_index == s_ucLinkRxReadIndex)
+		{
+			s_uiLinkRxOverflowCount++;
+		}
+		else
+		{
+			s_ucLinkRxBuffer[s_ucLinkRxWriteIndex] = value;
+			s_ucLinkRxWriteIndex = next_write_index;
+		}
 		USART_ClearITPendingBit(USART2, USART_IT_RXNE);
 	}
-}
-
-/*
-+------------------------------------------------------------------------------
-| Function    : Sum_check(void)
-+------------------------------------------------------------------------------
-| Description : check
-|
-| Parameters  : 
-| Returns     : 
-|
-+------------------------------------------------------------------------------
-*/
-unsigned char Sum_check(void)
-{ 
-  unsigned char i;
-  unsigned int checksum=0; 
-  for(i=0;i<rx_buffer[0]-2;i++)
-   checksum+=rx_buffer[i];
-  if((checksum%256)==rx_buffer[rx_buffer[0]-2])
-   return(0x01); //Checksum successful
-  else
-   return(0x00); //Checksum error
-}
-
-unsigned char UART2_CommandRoute(void)
-{
- if(RC_Flag&b_rx_over){
-		RC_Flag&=~b_rx_over;
-		if(Sum_check()){
-		return rx_buffer[1];
-		}
-	}
-return 0xff; //û���յ���λ�����������������Ч��û��ͨ��
 }
 
 

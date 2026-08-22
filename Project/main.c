@@ -17,6 +17,17 @@
 #define SOURCE_FLAG_METADATA_VALID      0x01u
 #define SOURCE_FLAG_HARDWARE_TIME_VALID 0x02u
 #define SOURCE_FLAG_CLOCK_72MHZ         0x04u
+#define SOURCE_FLAG_SLOTTED_TRANSMIT    0x08u
+#define SOURCE_FLAG_LINK_SYNCED         0x10u
+#define TOTAL_DEVICE_COUNT              9u
+#define DEFAULT_TRANSMIT_RATE_HZ        8u
+#ifndef WIRELESS_DEBUG_TEXT_ENABLED
+#define WIRELESS_DEBUG_TEXT_ENABLED     0
+#endif
+#if !WIRELESS_DEBUG_TEXT_ENABLED
+/* printf is wired to USART2 in this project; keep the production radio binary-only. */
+#define printf(...) (0)
+#endif
 #ifndef DEVICE_LOGICAL_ID
 #define DEVICE_LOGICAL_ID 0x03
 #endif
@@ -29,6 +40,25 @@ static uint32_t s_uiFrameSequence = 0;
 static volatile uint32_t s_uiSourceTimerOverflows = 0;
 static uint32_t s_uiSourceTimerHz = 1000000u;
 static uint8_t s_ucSourceFlags = SOURCE_FLAG_METADATA_VALID;
+static uint8_t s_ucTransmitRateHz = DEFAULT_TRANSMIT_RATE_HZ;
+static uint8_t s_ucTransmissionPaused = 0u;
+static uint8_t s_ucLinkScheduleSynchronized = 0u;
+static uint32_t s_uiScheduleEpochMs = 0u;
+static uint32_t s_uiLastScheduledCycle = 0xffffffffu;
+static uint32_t s_uiLastSentSampleGeneration = 0u;
+
+typedef struct
+{
+    int16_t Q0;
+    int16_t Q1;
+    int16_t Q2;
+    int16_t Q3;
+    uint32_t CapturedTickMs;
+    uint32_t Generation;
+    uint8_t Valid;
+} LatestQuaternionSample;
+
+static LatestQuaternionSample s_sLatestQuaternion;
 const uint32_t c_uiBaud[10] = {0, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
 
 void TIM4_Init(u16 pre, u16 psc)
@@ -251,6 +281,103 @@ static uint32_t ReadStableHardwareId(void)
     return hash == 0 ? 1u : hash;
 }
 
+/*
+ * Sensor acquisition remains at 10 Hz. There is deliberately only one sample
+ * slot: a newly acquired pose replaces the previous one, so congestion can
+ * never create a replay queue of stale poses.
+ */
+static void CaptureLatestQuaternion(void)
+{
+    if ((s_cDataUpdate & REQUIRED_UPDATE) != REQUIRED_UPDATE)
+        return;
+
+    __disable_irq();
+    s_sLatestQuaternion.Q0 = sReg[q0];
+    s_sLatestQuaternion.Q1 = sReg[q1];
+    s_sLatestQuaternion.Q2 = sReg[q2];
+    s_sLatestQuaternion.Q3 = sReg[q3];
+    s_cDataUpdate &= (unsigned char)~REQUIRED_UPDATE;
+    __enable_irq();
+
+    s_sLatestQuaternion.CapturedTickMs = ReadSourceTickMs();
+    s_sLatestQuaternion.Generation++;
+    if (s_sLatestQuaternion.Generation == 0u)
+        s_sLatestQuaternion.Generation = 1u;
+    s_sLatestQuaternion.Valid = 1u;
+}
+
+static void ProcessLinkCommands(void)
+{
+    UART2_LinkCommand command;
+
+    while (UART2_TryReadLinkCommand(&command))
+    {
+        if (command.Command == UART2_LINK_COMMAND_CONFIG_SYNC)
+        {
+            s_ucTransmitRateHz = command.TransmitRateHz;
+            s_ucTransmissionPaused = 0u;
+            s_ucLinkScheduleSynchronized = 1u;
+            s_uiScheduleEpochMs = ReadSourceTickMs();
+            s_uiLastScheduledCycle = 0xffffffffu;
+        }
+        else if (command.Command == UART2_LINK_COMMAND_PAUSE)
+        {
+            s_ucTransmissionPaused = 1u;
+        }
+    }
+}
+
+static void TrySendLatestQuaternion(uint32_t hardware_id)
+{
+    uint32_t now_ms;
+    uint32_t period_ms;
+    uint32_t elapsed_ms;
+    uint32_t cycle;
+    uint32_t phase_ms;
+    uint32_t slot_offset_ms;
+    uint32_t next_slot_offset_ms;
+    uint8_t source_flags;
+    float w, x, y, z;
+
+    if (s_ucTransmissionPaused || !s_sLatestQuaternion.Valid)
+        return;
+
+    period_ms = 1000u / s_ucTransmitRateHz;
+    now_ms = ReadSourceTickMs();
+    elapsed_ms = now_ms - s_uiScheduleEpochMs;
+    cycle = elapsed_ms / period_ms;
+    phase_ms = elapsed_ms % period_ms;
+    slot_offset_ms = ((uint32_t)(DEVICE_LOGICAL_ID - 1u) * period_ms) / TOTAL_DEVICE_COUNT;
+    next_slot_offset_ms = ((uint32_t)DEVICE_LOGICAL_ID * period_ms) / TOTAL_DEVICE_COUNT;
+
+    if ((phase_ms < slot_offset_ms) || (phase_ms >= next_slot_offset_ms) ||
+        (cycle == s_uiLastScheduledCycle))
+        return;
+
+    /* Reserve this cycle even if there is no new pose; never resend old data. */
+    s_uiLastScheduledCycle = cycle;
+    if (s_sLatestQuaternion.Generation == s_uiLastSentSampleGeneration)
+        return;
+
+    s_uiLastSentSampleGeneration = s_sLatestQuaternion.Generation;
+    w = s_sLatestQuaternion.Q0 / 32768.0f;
+    x = s_sLatestQuaternion.Q1 / 32768.0f;
+    y = s_sLatestQuaternion.Q2 / 32768.0f;
+    z = s_sLatestQuaternion.Q3 / 32768.0f;
+
+    source_flags = (uint8_t)(s_ucSourceFlags | SOURCE_FLAG_SLOTTED_TRANSMIT);
+    if (s_ucLinkScheduleSynchronized)
+        source_flags |= SOURCE_FLAG_LINK_SYNCED;
+
+    s_uiFrameSequence++;
+    UART2_siyuan_v2(DEVICE_LOGICAL_ID,
+                    hardware_id,
+                    s_uiFrameSequence,
+                    s_sLatestQuaternion.CapturedTickMs,
+                    source_flags,
+                    w, x, y, z);
+}
+
 static void SensorDataUpdata(uint32_t uiReg, uint32_t uiRegNum)
 {
 	int i;
@@ -349,38 +476,15 @@ int main(void)
     }
     s_cDataUpdate = 0;
     hardware_id = ReadStableHardwareId();
+    s_uiScheduleEpochMs = ReadSourceTickMs();
  
     while (1)
     {
-        Delayms(50); // 20Hz
-        CmdProcess(); 
- 
-        if ((s_cDataUpdate & REQUIRED_UPDATE) == REQUIRED_UPDATE) 
-        {
-            int16_t raw_q0, raw_q1, raw_q2, raw_q3;
-
-            __disable_irq();
-            raw_q0 = sReg[q0];
-            raw_q1 = sReg[q1];
-            raw_q2 = sReg[q2];
-            raw_q3 = sReg[q3];
-            s_cDataUpdate &= (unsigned char)~REQUIRED_UPDATE;
-            __enable_irq();
-
-            // 读取四元数数据
-            float w  = raw_q0 / 32768.0f;
-            float x  = raw_q1 / 32768.0f;
-            float y  = raw_q2 / 32768.0f;
-            float z  = raw_q3 / 32768.0f;
-            
-            s_uiFrameSequence++;
-            UART2_siyuan_v2(DEVICE_LOGICAL_ID,
-                            hardware_id,
-                            s_uiFrameSequence,
-                            ReadSourceTickMs(),
-                            s_ucSourceFlags,
-                            w, x, y, z);
-        }
+        Delayms(1);
+        CmdProcess();
+        ProcessLinkCommands();
+        CaptureLatestQuaternion();
+        TrySendLatestQuaternion(hardware_id);
     }
 }
 
